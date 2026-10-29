@@ -20,6 +20,13 @@ from .modulation import PhaseMask
 from . import functional as mplcF
 
 class MPLC(nn.Module):
+    """MPLC for (..., N) or (..., H, W) complex fields.
+
+    Use shape=N (or (N,)) for 1D and shape=(H, W) for 2D. Spacings
+    may be scalars or one value per spatial axis, ordered (dy, dx) in 2D.
+    Custom losses must reduce all spatial axes; for field_overlap_loss use
+    functools.partial(field_overlap_loss, spatial_ndim=model.spatial_ndim).
+    """
 
     def __init__(self, 
         shape, 
@@ -35,15 +42,34 @@ class MPLC(nn.Module):
 
         super().__init__()
 
-        self.shape = torch.tensor(shape, device = device)
-        self.spacing = torch.tensor(spacing, device = device)
-        self.mask_spacing = torch.tensor(mask_spacing, device = device)
-        self.mask_shape = (self.shape*self.spacing//self.mask_spacing).to(torch.int)
+        shape_values = torch.as_tensor(shape, device=device)
+        if (shape_values.ndim > 1 or shape_values.numel() not in (1, 2)
+                or not torch.isfinite(shape_values).all()
+                or (shape_values < 1).any()
+                or (shape_values != shape_values.long()).any()):
+            raise ValueError("shape must be a positive integer or a tuple of one or two positive integers.")
+        self.spatial_shape = tuple(int(n) for n in shape_values.reshape(-1))
+        self.spatial_ndim = len(self.spatial_shape)
+        # Preserve scalar self.shape for existing 1D notebooks.
+        shape_tensor = shape_values.long().reshape(()) if self.spatial_ndim == 1 else shape_values.long()
+        self.register_buffer('shape', shape_tensor)
+        for name, value in [('spacing', spacing), ('mask_spacing', mask_spacing)]:
+            values = torch.as_tensor(value, dtype=torch.float64, device=device).reshape(-1)
+            if (values.numel() not in (1, self.spatial_ndim)
+                    or not torch.isfinite(values).all() or (values <= 0).any()):
+                raise ValueError(f"{name} must be positive and finite, with one value or one per spatial axis.")
+            self.register_buffer(name, values.reshape(()) if values.numel() == 1 else values)
+        mask_size = self.shape * self.spacing / self.mask_spacing
+        # Avoid losing a control point to roundoff near an integer ratio.
+        mask_size = torch.where(torch.isclose(mask_size, mask_size.round(), rtol=1e-7, atol=1e-9),
+                                mask_size.round(), mask_size.floor()).long()
+        if (mask_size < 1).any():
+            raise ValueError("mask_spacing leaves fewer than one mask sample along an axis.")
+        self.register_buffer('mask_shape', mask_size)
         self.num_masks = num_masks
-        self.propagation_distance = torch.tensor(propagation_distance, device = device)
-        self.beam_waist = torch.tensor(beam_waist, device = device)
-        self.wavelength = torch.tensor(wavelength, device = device)
-        self.device = device
+        self.register_buffer('propagation_distance', torch.as_tensor(propagation_distance, device=device))
+        self.register_buffer('beam_waist', torch.as_tensor(beam_waist, device=device))
+        self.register_buffer('wavelength', torch.as_tensor(wavelength, device=device))
         self.register_buffer('smooth_weight', torch.tensor(smooth_weight, device = device))
         self.init_scale = init_scale
 
@@ -54,6 +80,10 @@ class MPLC(nn.Module):
         self.loss_history = []
         self.time_history = []
         self.epochs = 0
+
+    @property
+    def device(self):
+        return self.wavelength.device
         
     def add_mplc_stack(self):
 
@@ -71,16 +101,26 @@ class MPLC(nn.Module):
             self.propagators.append(propagator)
 
     def forward(self, field):
-        
+        if field.ndim < self.spatial_ndim or tuple(field.shape[-self.spatial_ndim:]) != self.spatial_shape:
+            raise ValueError(f"Expected trailing spatial shape {self.spatial_shape}, got {tuple(field.shape)}.")
+        if not torch.is_complex(field):
+            raise ValueError("Expected a complex-valued field.")
         return self.sequence(field)
     
     def smoothness_penalty(self):
 
-        laplacians = torch.stack([
-            mplcF.phase_laplacian(mask.theta)
-            for mask in self.phase_masks
-        ])
-        return self.smooth_weight * torch.mean(torch.abs(laplacians))
+        # Sum curvature penalties over spatial axes. In 1D this is the
+        # existing penalty; small axes have no second differences.
+        penalties = []
+        for mask in self.phase_masks:
+            penalty = mask.theta.sum() * 0
+            for dim in range(self.spatial_ndim):
+                if mask.theta.shape[dim] >= 3:
+                    penalty = penalty + mplcF.phase_laplacian(mask.theta, dim=dim).abs().mean()
+            penalties.append(penalty)
+        if not penalties:
+            return self.smooth_weight * 0
+        return self.smooth_weight * torch.stack(penalties).mean()
 
     def train_mplc(self, num_epochs, dataloader, optimizer, device, loss_func):
     
@@ -155,7 +195,8 @@ class MPLC(nn.Module):
     def visualize_model(self, show = False):
     
         fig_width = 6 + self.num_masks * 4  # Base width + width per mask
-        fig, axes = plt.subplots(1, self.num_masks + 1, figsize=(fig_width, 4))
+        fig, axes = plt.subplots(1, self.num_masks + 1, figsize=(fig_width, 4), squeeze=False)
+        axes = axes[0]
 
         # plot loss
         ax = axes[0]
@@ -169,8 +210,9 @@ class MPLC(nn.Module):
         # plot phase masks
         for i, mask in enumerate(self.phase_masks):
             ax = axes[i + 1]
-            theta = np.array([mask.get_theta(self.shape).detach().cpu() for i in range(self.shape)])
-            im = ax.imshow(theta, vmin=-np.pi, vmax=np.pi, cmap='twilight', origin='lower')
+            theta = mask.get_theta(self.spatial_shape).detach().cpu().numpy()
+            im = ax.imshow(theta if self.spatial_ndim == 2 else theta[None, :],
+                           vmin=-np.pi, vmax=np.pi, cmap='twilight', origin='lower', aspect='auto')
             fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label='Phase [rad]')
             ax.set_title(f'Phase Mask {i + 1}')
 
@@ -184,7 +226,10 @@ class MPLC(nn.Module):
     @torch.no_grad()
     def visualize_field(self, input_fields, show=True, far_field=False):
         """
-        Visualize 1D complex fields through the MPLC.
+        Visualize complex fields through the MPLC.
+
+        2D fields use amplitude and phase image pairs at each step. The
+        2D far-field view displays the full centered FFT without mode cropping.
 
         Rows:
             One row per input field.
@@ -205,6 +250,16 @@ class MPLC(nn.Module):
 
             whose Fourier peaks are centred at f = m / w0.
         """
+
+        if torch.is_tensor(input_fields) and input_fields.ndim == self.spatial_ndim:
+            input_fields = input_fields.unsqueeze(0)
+        if len(input_fields) == 0:
+            raise ValueError("Provide at least one input field.")
+        for field in input_fields:
+            if tuple(field.shape) != self.spatial_shape:
+                raise ValueError(f"Expected individual fields of shape {self.spatial_shape}.")
+        if self.spatial_ndim == 2:
+            return self._visualize_field_2d(input_fields, show, far_field)
 
         # ------------------------------------------------------------
         # Extract mask / propagation layers
@@ -337,7 +392,7 @@ class MPLC(nn.Module):
             fx = torch.fft.fftshift(
                 torch.fft.fftfreq(
                     S,
-                    d=self.spacing,
+                    d=float(self.spacing),
                     device=field.device,
                     dtype=field.real.dtype,
                 )
@@ -539,7 +594,7 @@ class MPLC(nn.Module):
         for row, field in enumerate(input_fields):
 
             current_field = (
-                field.detach().clone()
+                field.detach().clone().to(self.device)
             )
 
             # --------------------------------------------------------
@@ -639,13 +694,66 @@ class MPLC(nn.Module):
 
         return fig
 
+    @torch.no_grad()
+    def _visualize_field_2d(self, input_fields, show, far_field):
+        n_fields = len(input_fields)
+        n_cols = self.num_masks + 1
+        fig, axes = plt.subplots(2 * n_fields, n_cols, squeeze=False,
+                                 figsize=(4 * n_cols, 6 * n_fields))
+        spacing = self.spacing.reshape(-1)
+        dy, dx = float(spacing[0]), float(spacing[-1])
+        height, width = self.spatial_shape
+
+        if far_field:
+            fy = np.fft.fftshift(np.fft.fftfreq(height, d=dy))
+            fx = np.fft.fftshift(np.fft.fftfreq(width, d=dx))
+            extent = [fx[0] - 0.5 / (width * dx), fx[-1] + 0.5 / (width * dx),
+                      fy[0] - 0.5 / (height * dy), fy[-1] + 0.5 / (height * dy)]
+        else:
+            extent = [-width * dx / 2, width * dx / 2,
+                      -height * dy / 2, height * dy / 2]
+
+        for row, field in enumerate(input_fields):
+            current = field.to(self.device)
+            fields = [current]
+            for mask, propagator in zip(self.phase_masks, self.propagators):
+                current = propagator(mask(current))
+                fields.append(current)
+            displays = [torch.fft.fftshift(torch.fft.fft2(
+                torch.fft.ifftshift(value, dim=(-2, -1)), norm='ortho'), dim=(-2, -1))
+                if far_field else value for value in fields]
+            vmax = max(float(value.abs().max()) for value in displays) or 1.0
+            for col, (value, displayed) in enumerate(zip(fields, displays)):
+                amplitude = displayed.abs().cpu().numpy()
+                phase = displayed.angle().cpu().numpy()
+                amp_ax, phase_ax = axes[2 * row, col], axes[2 * row + 1, col]
+                amp_im = amp_ax.imshow(amplitude, origin='lower', extent=extent,
+                                       cmap='gray', vmin=0, vmax=vmax)
+                phase_im = phase_ax.imshow(phase, origin='lower', extent=extent,
+                                           cmap='twilight', vmin=-np.pi, vmax=np.pi)
+                label = 'Input' if col == 0 else f'After Mask {col}'
+                amp_ax.set_title(f'{label} | P={value.abs().square().sum().item():.3f}')
+                phase_ax.set_title('Phase' + (' (FFT)' if far_field else ''))
+                for ax in (amp_ax, phase_ax):
+                    ax.set_xlabel('Spatial frequency fx' if far_field else 'x')
+                    ax.set_ylabel('Spatial frequency fy' if far_field else 'y')
+                fig.colorbar(amp_im, ax=amp_ax, label='Amplitude')
+                fig.colorbar(phase_im, ax=phase_ax, label='Phase [rad]')
+        fig.tight_layout()
+        if show:
+            plt.show()
+        return fig
+
     def vizualize_phase_gradient(self):
+
+        if self.spatial_ndim == 2:
+            return self._visualize_phase_gradient_2d()
 
         phases = [mask.get_theta(self.shape).detach() for mask in self.phase_masks]
         phase_grads = [mplcF.phase_gradient(phase, self.spacing) for phase in phases]
 
         for i, grad in enumerate(phase_grads):
-            plt.plot(grad, label = f'Phase Mask {i+1}')
+            plt.plot(grad.detach().cpu().numpy(), label = f'Phase Mask {i+1}')
 
         plt.xlabel('x-postition')
         plt.ylabel('Phase Gradient')
@@ -658,7 +766,32 @@ class MPLC(nn.Module):
         plt.legend(loc = 'center right')
         plt.show()
 
+    @torch.no_grad()
+    def _visualize_phase_gradient_2d(self):
+        fig, axes = plt.subplots(self.num_masks, 2, squeeze=False,
+                                 figsize=(9, 3.5 * self.num_masks))
+        spacing = self.spacing.reshape(-1)
+        threshold = np.pi / 50e-6
+        for row, mask in enumerate(self.phase_masks):
+            phase = mask.get_theta(self.spatial_shape)
+            for dim, label in [(0, 'y'), (1, 'x')]:
+                grad = mplcF.phase_gradient(phase, spacing[0 if dim == 0 else -1], dim=dim)
+                # The last row/column has no forward difference.
+                if grad.numel() == 0:
+                    values = np.zeros((1, 1))
+                else:
+                    values = grad.cpu().numpy()
+                ax = axes[row, dim]
+                im = ax.imshow(values, origin='lower', aspect='auto', cmap='coolwarm',
+                               vmin=-threshold, vmax=threshold)
+                ax.set_title(f'Mask {row + 1}: d phase / d{label}')
+                fig.colorbar(im, ax=ax, label='Phase gradient [rad/m]')
+        fig.tight_layout()
+        plt.show()
+        return fig
+
     def export_masks(self, filename):
+        """Save sampled phases as column CSVs (1D) or H-by-W CSVs (2D)."""
 
         phases = [mask.get_theta(self.shape).detach() for mask in self.phase_masks]
         
@@ -678,8 +811,8 @@ class MPLC(nn.Module):
         folder.mkdir(parents=True)
 
         for i, phase in enumerate(phases):
-            if phase.ndim != 1:
-                raise ValueError(f"phases[{i}] must be a 1D tensor.")
+            if phase.ndim != self.spatial_ndim:
+                raise ValueError(f"phases[{i}] must have {self.spatial_ndim} spatial dimensions.")
 
             np.savetxt(
                 folder / f"phase_{i + 1}.csv",
@@ -690,6 +823,12 @@ class MPLC(nn.Module):
         print(f"Saved {len(phases)} phases to '{folder}'.")
 
     def import_masks(self, filename, *, atol=1e-4):
+        """Fit control phases from sampled CSVs, verifying angular error.
+
+        Each spatial axis must be sampled at least as finely as the mask.
+        All masks are restored if reconstruction fails. In 2D the fit uses
+        the same sequential-unwrapping convention as phase interpolation.
+        """
         folder = Path(filename)
 
         if not folder.exists():
@@ -738,9 +877,9 @@ class MPLC(nn.Module):
             with torch.no_grad():
                 expected_phase = mask.get_theta(self.shape)
 
-            if expected_phase.ndim != 1 or mask.theta.ndim != 1:
+            if expected_phase.ndim != self.spatial_ndim or mask.theta.ndim != self.spatial_ndim:
                 raise ValueError(
-                    f"Mask {i}: expected 1D phase tensors; "
+                    f"Mask {i}: expected {self.spatial_ndim}D phase tensors; "
                     f"got output shape {tuple(expected_phase.shape)} "
                     f"and parameter shape {tuple(mask.theta.shape)}."
                 )
@@ -758,10 +897,11 @@ class MPLC(nn.Module):
             n_samples = expected_phase.numel()
             n_controls = mask.theta.numel()
 
-            if data.shape != (n_samples, 1):
+            expected_csv_shape = (n_samples, 1) if self.spatial_ndim == 1 else tuple(expected_phase.shape)
+            if data.shape != expected_csv_shape:
                 raise ValueError(
                     f"Mask {i}: wrong CSV shape {data.shape}; "
-                    f"expected ({n_samples}, 1)."
+                    f"expected {expected_csv_shape}."
                 )
 
             if not np.isfinite(data).all():
@@ -769,7 +909,7 @@ class MPLC(nn.Module):
                     f"Mask {i}: CSV contains NaN or infinity."
                 )
 
-            if n_samples < n_controls:
+            if any(n < c for n, c in zip(expected_phase.shape, mask.theta.shape)):
                 raise ValueError(
                     f"Mask {i}: {n_samples} saved samples cannot "
                     f"uniquely determine {n_controls} trainable "
@@ -778,46 +918,28 @@ class MPLC(nn.Module):
                 )
 
             saved = torch.from_numpy(
-                data[:, 0].copy()
+                (data[:, 0] if self.spatial_ndim == 1 else data).copy()
             ).to(torch.float64)
 
-            # Unwrap phases using the same convention as
-            # mplcF.interpolate_phase
-            delta = torch.remainder(
-                saved[1:] - saved[:-1] + torch.pi,
-                2 * torch.pi
-            ) - torch.pi
-
-            unwrapped = torch.cat((
-                saved[:1],
-                saved[:1] + torch.cumsum(delta, dim=0)
-            ))
-
-            # Build the interpolation matrix corresponding
-            # to F.interpolate(..., align_corners=True).
-            x = torch.linspace(
-                0, n_controls - 1, n_samples,
-                dtype=torch.float64
-            )
-
-            left = x.floor().long()
-            right = (left + 1).clamp(max=n_controls - 1)
-            alpha = x - left
-
-            A = torch.zeros(
-                (n_samples, n_controls),
-                dtype=torch.float64
-            )
-
-            rows = torch.arange(n_samples)
-
-            A[rows, left] = 1 - alpha
-            A[rows, right] += alpha
-
-            # Recover control-point phases by least squares
-            fitted_theta = torch.linalg.lstsq(
-                A, unwrapped
-            ).solution
+            if tuple(expected_phase.shape) == tuple(mask.theta.shape):
+                # No interpolation: retain arbitrary pixel phases, including vortices.
+                fitted_theta = saved.clone()
+            else:
+                fitted_theta = mplcF.unwrap_phase(saved)
+                # Bilinear interpolation is separable: solve one small system
+                # per axis rather than building a huge 2D interpolation matrix.
+                for dim, (n, c) in enumerate(zip(expected_phase.shape, mask.theta.shape)):
+                    x = torch.linspace(0, c - 1, n, dtype=torch.float64)
+                    left = x.floor().long()
+                    right = (left + 1).clamp(max=c - 1)
+                    alpha = x - left
+                    A = torch.zeros((n, c), dtype=torch.float64)
+                    rows = torch.arange(n)
+                    A[rows, left] = 1 - alpha
+                    A[rows, right] += alpha
+                    moved = fitted_theta.movedim(dim, 0)
+                    solved = torch.linalg.lstsq(A, moved.reshape(n, -1)).solution
+                    fitted_theta = solved.reshape((c,) + moved.shape[1:]).movedim(0, dim)
 
             fitted_theta = fitted_theta.to(
                 device=mask.theta.device,

@@ -5,26 +5,32 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib import cm, colors
 
-def field_norm(field):
+def field_norm(field, spatial_ndim=1):
 
-    return torch.sqrt(torch.abs(field_inner(field, field)))
+    return torch.sqrt(torch.abs(field_inner(field, field, spatial_ndim)))
 
-def field_inner(field1, field2):
+def field_inner(field1, field2, spatial_ndim=1):
 
-    return torch.einsum('...x, ...x -> ...', field1, torch.conj(field2))
+    if spatial_ndim not in (1, 2):
+        raise ValueError("spatial_ndim must be 1 or 2.")
+    return (field1 * torch.conj(field2)).sum(dim=tuple(range(-spatial_ndim, 0)))
 
-def field_overlap_loss(field1, field2):
+def field_overlap_loss(field1, field2, spatial_ndim=1):
 
-        return 1 - torch.mean(torch.abs(torch.einsum('bx, bx ->b', field1, torch.conj(field2)))**2)
+    """Overlap loss; pass spatial_ndim=2 for fields shaped (..., H, W)."""
+    return 1 - field_inner(field1, field2, spatial_ndim).abs().square().mean()
 
 
-def normalize_field(field):
-    norm = torch.sqrt(torch.sum(torch.abs(field) ** 2, dim= -1, keepdim=True))
+def normalize_field(field, spatial_ndim=1):
+    if spatial_ndim not in (1, 2):
+        raise ValueError("spatial_ndim must be 1 or 2.")
+    norm = torch.sqrt(torch.sum(torch.abs(field) ** 2,
+                               dim=tuple(range(-spatial_ndim, 0)), keepdim=True))
     return field / norm
 
-def phase_gradient(theta, dx = 1):
+def phase_gradient(theta, dx = 1, dim=-1):
     
-    dtheta = theta[..., 1:] - theta[..., :-1]
+    dtheta = torch.diff(theta, dim=dim)
     dtheta_wrapped = torch.atan2(torch.sin(dtheta), torch.cos(dtheta))
     return dtheta_wrapped/dx
 
@@ -33,13 +39,13 @@ def gradient(y, dx = 1):
     return dy/dx
 
 
-def phase_laplacian(theta, dx=1):
+def phase_laplacian(theta, dx=1, dim=-1):
     # Wrapped phase differences
-    dtheta = theta[..., 1:] - theta[..., :-1]
+    dtheta = torch.diff(theta, dim=dim)
     dtheta_wrapped = torch.atan2(torch.sin(dtheta), torch.cos(dtheta))
 
     # Second derivative: change in the wrapped phase gradient
-    return (dtheta_wrapped[..., 1:] - dtheta_wrapped[..., :-1]) / dx**2
+    return torch.diff(dtheta_wrapped, dim=dim) / dx**2
 
 def hadamard(D):
 
@@ -51,24 +57,44 @@ def hadamard(D):
 
     return hadamard_matrix
 
+def xgate(D,m):
+    
+    # D = torch.tensor(D)
+    # m = torch.tensor(m)
+    x_matrix = torch.eye(D, dtype=dtype)
+    x_matrix = torch.roll(x_matrix,m,0)
+    return x_matrix
+
+def unwrap_phase(phase):
+    """Unwrap axes in order (y then x in 2D).
+
+    This is a deterministic interpolation convention for smooth surfaces,
+    not a general 2D phase-unwrapping algorithm for surfaces with vortices.
+    """
+    unwrapped = phase
+    for dim in range(phase.ndim):
+        delta = torch.diff(unwrapped, dim=dim)
+        delta = torch.remainder(delta + torch.pi, 2 * torch.pi) - torch.pi
+        first = unwrapped.narrow(dim, 0, 1)
+        unwrapped = torch.cat((first, first + delta.cumsum(dim)), dim=dim)
+    return unwrapped
+
+
 def interpolate_phase(phase, field_shape):
-    # Differences between adjacent samples
-    delta = phase[1:] - phase[:-1]
+    """Resize a 1D/2D phase mask using unwrapped linear/bilinear interpolation."""
+    size = tuple(int(n) for n in torch.as_tensor(field_shape).reshape(-1))
+    if phase.ndim not in (1, 2) or len(size) != phase.ndim:
+        raise ValueError("Mask and field must have the same spatial dimensionality (1 or 2).")
+    if any(n < 1 for n in size):
+        raise ValueError("Field dimensions must be positive.")
+    if tuple(phase.shape) == size:
+        return torch.remainder(phase + torch.pi, 2 * torch.pi) - torch.pi
 
-    # Choose each difference modulo 2π with minimum magnitude
-    delta = torch.remainder(delta + torch.pi, 2 * torch.pi) - torch.pi
-
-    # Reconstruct a continuous, unwrapped phase
-    unwrapped = torch.cat([
-        phase[:1],
-        phase[:1] + torch.cumsum(delta, dim=0),
-    ])
-
-    # Linearly interpolate the unwrapped phase
+    unwrapped = unwrap_phase(phase)
     interpolated_phase_unwrapped = F.interpolate(
-        unwrapped[None, None, :],
-        size=field_shape,
-        mode="linear",
+        unwrapped[None, None],
+        size=size,
+        mode="linear" if phase.ndim == 1 else "bilinear",
         align_corners=True,
     )[0, 0]
 
@@ -77,7 +103,6 @@ def interpolate_phase(phase, field_shape):
         2 * torch.pi,
     ) - torch.pi
 
-    # Wrap back into [-π, π)
     return interpolated_phase_wrapped
 
 @torch.no_grad()

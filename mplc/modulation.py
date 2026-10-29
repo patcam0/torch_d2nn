@@ -9,8 +9,10 @@ class PhaseMask(nn.Module):
 
         super().__init__()
 
-        self.mask_shape = mask_shape
-        init_theta = torch.randn(mask_shape, device = device)*init_scale
+        self.mask_shape = tuple(int(n) for n in torch.as_tensor(mask_shape).reshape(-1))
+        if len(self.mask_shape) not in (1, 2) or any(n < 1 for n in self.mask_shape):
+            raise ValueError("mask_shape must contain one or two positive dimensions.")
+        init_theta = torch.randn(self.mask_shape, device = device)*init_scale
         self.theta = nn.Parameter(init_theta)
 
         
@@ -22,5 +24,5 @@ class PhaseMask(nn.Module):
 
     def forward(self, field):
 
-        phase_mask = torch.exp(1j*self.get_theta(field.shape[-1]))
+        phase_mask = torch.exp(1j*self.get_theta(field.shape[-self.theta.ndim:]))
         return field*phase_mask

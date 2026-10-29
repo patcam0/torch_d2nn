@@ -14,7 +14,7 @@ def get_basis_fields(D, shape, spacing, beam_waist, device, separation = 1):
     def kmode(m, shape, spacing, beam_waist, device, separation):
 
         Sx = shape
-        m = torch.tensor(m)
+        m = torch.tensor(m, device=device)
         x = torch.arange(-Sx//2,Sx//2, device = device)*spacing
 
         kmode = torch.exp(-(x**2)/beam_waist**2)*torch.exp((2j*torch.pi/beam_waist)*m*x)+1e-5
@@ -32,12 +32,25 @@ def get_basis_fields(D, shape, spacing, beam_waist, device, separation = 1):
 
     return torch.stack(basis_fields, dim=0)
 
+def get_basis_fields_pos(D, shape, spacing, beam_waist, device, separation = 1):
+    """Return normalized Gaussian fields displaced in transverse position.
+
+    ``spacing`` and ``beam_waist`` are in metres. Adjacent centers are
+    ``separation * beam_waist`` apart and symmetric about zero. The field
+    envelope is exp(-((x - center) / beam_waist)**2), so beam_waist is
+    the 1/e field radius (equivalently, the 1/e**2 intensity radius).
+    """
+    x = (torch.arange(shape, device=device) - shape // 2) * spacing
+    centers = (torch.arange(D, device=device) - (D - 1) / 2) * separation * beam_waist
+    fields = torch.exp(-((x[None, :] - centers[:, None]) / beam_waist)**2)
+    return mplcF.normalize_field(fields).to(dtype=torch.complex64)
+
 def encode(x, basis_fields):
-    return torch.einsum('bd, dx -> bx', x, basis_fields)
+    return torch.einsum('bd, d... -> b...', x, basis_fields)
 
 def decode(field, basis_fields):
 
-    return torch.einsum('bx, dx -> bd', field, torch.conj(basis_fields))
+    return torch.einsum('b..., d... -> bd', field, torch.conj(basis_fields))
 
 def get_sic_kets(D):
             from qbism import sic_povm
@@ -62,13 +75,16 @@ class FieldDataset(Dataset):
     def __init__(self, target, basis_fields):
 
         super().__init__()
-        self.target = target
+        # NumPy SIC kets and random inputs start on the CPU. Encode them
+        # on the same device and with the same dtype as the basis fields.
+        self.target = target.to(device=basis_fields.device, dtype=basis_fields.dtype)
         self.dimension = target.shape[0]
 
-        input_kets = self.get_inputs()
-        output_kets = torch.einsum('ij, bj -> bi', target, input_kets)
-        self.inputs = mplcF.normalize_field(encode(input_kets, basis_fields))
-        self.outputs = mplcF.normalize_field(encode(output_kets, basis_fields))
+        input_kets = self.get_inputs().to(device=basis_fields.device, dtype=basis_fields.dtype)
+        output_kets = torch.einsum('ij, bj -> bi', self.target, input_kets)
+        spatial_ndim = basis_fields.ndim - 1
+        self.inputs = mplcF.normalize_field(encode(input_kets, basis_fields), spatial_ndim)
+        self.outputs = mplcF.normalize_field(encode(output_kets, basis_fields), spatial_ndim)
     
     def get_inputs(self):
 
